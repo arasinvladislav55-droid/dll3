@@ -203,10 +203,10 @@ static bool Button(const char* label, float w = -1) {
     dl->AddText({p.x + (aw - ts.x) * 0.5f, p.y + 7}, IM_COL32_WHITE, label);
     ImGui::PopID(); return pr;
 }
-static float RowH(int t, int s, int c, int co = 0, int kb = 0, int b = 0) { return 40 + t * 31 + s * 43 + c * 31 + co * 56 + kb * 35 + b * 39 + 10; }
+static float RowH(int t, int s, int c, int co = 0, int kb = 0, int b = 0) { return (float)(40 + t * 31 + s * 43 + c * 31 + co * 56 + kb * 35 + b * 39 + 10); }
 static void BeginCard(const char* title, float w, float h) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16, 12});
-    ImGui::BeginChild(title, {w, h}, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouseWheel);
+    ImGui::BeginChild(title, {w, h}, false, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImGui::GetWindowDrawList()->AddRectFilled({p.x, p.y + 2}, {p.x + 3, p.y + 16}, AccU(), 2);
     ImGui::GetWindowDrawList()->AddText({p.x + 10, p.y}, IM_COL32(245, 245, 255, 255), title);
@@ -227,7 +227,7 @@ static void DrawMenu() {
     else ImGui::SetNextWindowPos(g_menuPos, ImGuiCond_Once);
     ImGui::SetNextWindowSize(SZ, ImGuiCond_Always);
     ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouseWheel | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
     ImVec2 wp = ImGui::GetWindowPos(); if (g_menuAnim >= 0.999f) g_menuPos = wp;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float R = cfg.rounding;

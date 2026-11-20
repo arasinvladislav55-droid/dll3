@@ -1,6 +1,7 @@
-// Косметический DX11-оверлей v2 (DLL). Visual Studio, x64, C++17, флаг компилятора /utf-8.
-// Зависимости: Dear ImGui (imgui, imgui_impl_win32, imgui_impl_dx11), MinHook.
-// Предназначено для собственных приложений / одиночных проектов.
+// Косметический OpenGL-оверлей для Minecraft Java Edition (Windows x64).
+// Хукает gdi32!SwapBuffers (его вызывает GLFW/LWJGL) и рисует ImGui поверх кадра игры.
+// Загрузка: System.load / -agentpath (JNI_OnLoad / Agent_OnLoad) либо обычный LoadLibrary (DllMain).
+// Меню: INSERT (меняется в настройках).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -9,100 +10,69 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include <Windows.h>
-#include <d3d11.h>
-#include <dxgi.h>
+#include <GL/gl.h>
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <cstdio>
-#include <thread>
+#include <cstring>
+#include <string>
 #include "imgui.h"
 #include "imgui_internal.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_dx11.h"
+#include "imgui_impl_opengl3.h"
 #include "MinHook.h"
 
-#pragma comment(lib, "d3d11.lib")
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+#pragma comment(lib, "opengl32.lib")
 
 // ============================================================ конфиг
 struct Config {
-    int version = 2;
+    int version = 3;
     // прицел
     bool crossOn = true, crossDot = true, crossOutline = true, crossSpin = false; int crossStyle = 0;
     float crossSize = 8, crossGap = 4, crossThick = 2, crossSpinSpeed = 90, crossDyn = 6;
     float crossCol[4] = {1, 1, 1, 1};
-    // хитмаркер
-    bool hitOn = true, hitSound = false; int hitFreq = 900; float hitSize = 10, hitTime = 0.25f;
-    float hitCol[4] = {1, 0.3f, 0.3f, 1};
-    // числа урона
-    bool dmgOn = true; float dmgLife = 1.0f, dmgRise = 60, dmgSize = 22;
-    float dmgCol[4] = {1, 0.85f, 0.2f, 1}, critCol[4] = {1, 0.3f, 0.2f, 1};
-    // частицы
-    bool partOn = true; int partCount = 14; float partSpeed = 140, partLife = 0.6f, partGrav = 220, partSize = 3;
-    float partCol[4] = {1, 0.6f, 0.1f, 1};
+    // эффект клика
+    bool burstOn = true; int burstCount = 10; float burstSpeed = 120, burstLife = 0.5f, burstGrav = 200, burstSize = 3;
+    float burstCol[4] = {1, 0.6f, 0.1f, 1};
     // экран
-    bool vigOn = true; float vigSize = 0.18f, vigStr = 0.5f; float vigCol[4] = {0, 0, 0, 1};
-    bool flashOn = true; float flashStr = 0.6f; float flashCol[4] = {1, 0.1f, 0.1f, 1};
-    bool lowHpOn = true; float lowHpThr = 35;
+    bool vigOn = false; float vigSize = 0.18f, vigStr = 0.5f; float vigCol[4] = {0, 0, 0, 1};
+    bool glowOn = false; float glowSize = 0.2f, glowStr = 0.5f; float glowCol[4] = {0.45f, 0.35f, 1, 1};
     bool tintOn = false; float tintCol[4] = {0.2f, 0.4f, 1, 0.12f};
     bool trailOn = false; float trailLife = 0.4f, trailWidth = 4; float trailCol[4] = {0.5f, 0.4f, 1, 1};
     // HUD
-    bool fpsOn = true, wmOn = true, clockOn = true, graphOn = true, barsOn = true;
-    bool ksOn = true, cpsOn = true; float ksX = 0.02f, ksY = 0.45f;
-    bool compOn = false; float compW = 360;
-    bool comboOn = true; float comboTime = 3;
-    // камера
-    bool zoomOn = true; int zoomKey = 'C', zoomMode = 0; float zoomFov = 0.4f, zoomSpeed = 10;
+    bool fpsOn = true, wmOn = true, clockOn = false, graphOn = false;
+    bool ksOn = false, cpsOn = true; float ksX = 0.02f, ksY = 0.45f;
     // тема
     int menuKey = VK_INSERT; float accent[4] = {0.45f, 0.35f, 1.0f, 1.0f};
     bool rainbow = false, glow = true; float rounding = 10, menuAlpha = 0.97f, animSpeed = 6;
 } cfg;
 
-static const char* CFG_FILE = "visuals.cfg";
+static std::wstring g_dir = L".";
 static char g_status[64] = "";
-static void SaveCfg() { if (FILE* f = fopen(CFG_FILE, "wb")) { fwrite(&cfg, sizeof cfg, 1, f); fclose(f); strcpy(g_status, "Сохранено"); } }
-static void LoadCfg() {
-    if (FILE* f = fopen(CFG_FILE, "rb")) {
-        Config t; if (fread(&t, sizeof t, 1, f) == 1 && t.version == 2) { cfg = t; strcpy(g_status, "Загружено"); }
-        else strcpy(g_status, "Файл несовместим");
+static std::wstring CfgPath() { return g_dir + L"\\visuals.cfg"; }
+static void SaveCfg() { if (FILE* f = _wfopen(CfgPath().c_str(), L"wb")) { fwrite(&cfg, sizeof cfg, 1, f); fclose(f); strcpy(g_status, "Сохранено"); } else strcpy(g_status, "Не удалось сохранить"); }
+static void LoadCfg(bool quiet = false) {
+    if (FILE* f = _wfopen(CfgPath().c_str(), L"rb")) {
+        Config t; if (fread(&t, sizeof t, 1, f) == 1 && t.version == 3) { cfg = t; if (!quiet) strcpy(g_status, "Загружено"); }
+        else if (!quiet) strcpy(g_status, "Файл несовместим");
         fclose(f);
-    } else strcpy(g_status, "Файл не найден");
+    } else if (!quiet) strcpy(g_status, "Файл не найден");
 }
 
 // ============================================================ состояние
-struct DmgNum { float x, y, val, age, drift; bool crit; };
 struct Particle { float x, y, vx, vy, age; };
 struct TrailPt { ImVec2 p; float age; };
-static std::vector<DmgNum> g_dmg;
 static std::vector<Particle> g_parts;
 static std::vector<TrailPt> g_trail;
 static std::vector<double> g_clicksL, g_clicksR;
-static float g_hitTimer = 0, g_flash = 0, g_pulse = 0, g_killTimer = 0, g_comboTimer = 0, g_comboPop = 0;
-static bool g_lastCrit = false, g_zooming = false, g_menuOpen = true;
-static int g_combo = 0, g_kills = 0;
-static float g_hp = 100, g_armor = 100, g_yaw = 0, g_fov = 1; static int g_ammo = 30, g_reserve = 90;
-static float g_menuAnim = 0; static ImVec2 g_menuPos(200, 100); static float g_menuAlphaNow = 1;
+static float g_pulse = 0;
+static bool g_menuOpen = false;
+static float g_menuAnim = 0; static ImVec2 g_menuPos(100, 60); static float g_menuAlphaNow = 1;
 static int* g_bindTarget = nullptr; static HWND g_hwnd = nullptr;
 static ImVec4 g_acc;
-
-// ---- экспорт: вызывается вашим приложением
-extern "C" __declspec(dllexport) void Visuals_OnHit(float x, float y, float damage, bool crit) {
-    g_hitTimer = cfg.hitTime; g_lastCrit = crit; g_flash = 1; g_pulse = 1;
-    g_combo++; g_comboTimer = cfg.comboTime; g_comboPop = 1;
-    g_dmg.push_back({x, y, damage, 0, ((rand() % 100) - 50) * 0.5f, crit});
-    for (int i = 0; i < cfg.partCount; i++) {
-        float a = (float)i / cfg.partCount * 6.2831f + (rand() % 100) * 0.01f;
-        float s = cfg.partSpeed * (0.5f + (rand() % 100) * 0.01f);
-        g_parts.push_back({x, y, cosf(a) * s, sinf(a) * s, 0});
-    }
-    if (cfg.hitSound) { int f = cfg.hitFreq; std::thread([f] { Beep(f, 35); }).detach(); }
-}
-extern "C" __declspec(dllexport) void Visuals_OnKill() { g_kills++; g_killTimer = 1.4f; }
-extern "C" __declspec(dllexport) void Visuals_SetStats(float hp, float armor, int ammo, int reserve) { g_hp = hp; g_armor = armor; g_ammo = ammo; g_reserve = reserve; }
-extern "C" __declspec(dllexport) void Visuals_SetYaw(float deg) { g_yaw = deg; }
-extern "C" __declspec(dllexport) float Visuals_GetFovMultiplier() { return cfg.zoomOn ? g_fov : 1.0f; }
-extern "C" __declspec(dllexport) void Visuals_ShowMenu(bool show) { g_menuOpen = show; }
+static float g_vx = 0, g_vy = 0, g_scale = 1;   // виртуальный курсор (пиксели окна) и масштаб интерфейса
+static bool g_captured = false;                 // игра «захватила» мышь (мы в мире, а не в экране меню)
 
 // ============================================================ вспомогательное
 static ImU32 CU(const float* c, float a = 1) { return ImGui::ColorConvertFloat4ToU32(ImVec4(c[0], c[1], c[2], c[3] * a)); }
@@ -216,33 +186,30 @@ static void EndCard() { ImGui::EndChild(); ImGui::PopStyleVar(); }
 
 // ============================================================ меню
 static void DrawMenu() {
-    static int tab = 0, prevTab = 0; static float tabAnim = 1, indY = 76;
-    const char* tabs[] = {"Прицел", "Эффекты", "Экран", "HUD", "Камера", "Тема", "Конфиг"};
-    const int NT = 7; const ImVec2 SZ(780, 520);
+    static int tab = 0; static float tabAnim = 1, indY = 80;
+    const char* tabs[] = {"Прицел", "Эффекты", "Экран", "HUD", "Тема", "Конфиг"};
+    const int NT = 6; const ImVec2 SZ(780, 520);
     float e = 1 - powf(1 - g_menuAnim, 3.f);
     g_menuAlphaNow = e * cfg.menuAlpha;
 
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, g_menuAlphaNow);
-    if (g_menuAnim < 0.999f) ImGui::SetNextWindowPos({g_menuPos.x, g_menuPos.y + (1 - e) * 30}, ImGuiCond_Always);
-    else ImGui::SetNextWindowPos(g_menuPos, ImGuiCond_Once);
+    ImGui::SetNextWindowPos({g_menuPos.x, g_menuPos.y + (1 - e) * 30}, ImGuiCond_Always);
     ImGui::SetNextWindowSize(SZ, ImGuiCond_Always);
-    ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
+    ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
-    ImVec2 wp = ImGui::GetWindowPos(); if (g_menuAnim >= 0.999f) g_menuPos = wp;
+    ImVec2 wp = ImGui::GetWindowPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float R = cfg.rounding;
 
-    // тень и свечение (за окном)
     ImDrawList* bg = ImGui::GetBackgroundDrawList();
     bg->AddRectFilled({0, 0}, ImGui::GetIO().DisplaySize, IM_COL32(0, 0, 0, (int)(110 * e)));
     for (int i = 1; i <= 8; i++)
         bg->AddRectFilled({wp.x - i * 3.f, wp.y - i * 3.f + 6}, {wp.x + SZ.x + i * 3.f, wp.y + SZ.y + i * 3.f + 6}, IM_COL32(0, 0, 0, (int)(16 * e)), R + i * 3);
     if (cfg.glow) for (int i = 1; i <= 4; i++) bg->AddRect({wp.x - i, wp.y - i}, {wp.x + SZ.x + i, wp.y + SZ.y + i}, AccU(0.10f * e / i), R + i, 0, 1.5f);
 
-    // боковая панель
     dl->AddRectFilled(wp, {wp.x + 170, wp.y + SZ.y}, IM_COL32(13, 13, 18, 255), R, ImDrawFlags_RoundCornersLeft);
     dl->AddText(ImGui::GetFont(), 26, {wp.x + 24, wp.y + 16}, AccU(), "VISUALS");
-    dl->AddText({wp.x + 26, wp.y + 46}, IM_COL32(120, 120, 140, 255), "overlay v2");
+    dl->AddText({wp.x + 26, wp.y + 46}, IM_COL32(120, 120, 140, 255), "overlay v3 (OpenGL)");
 
     float targetY = 80.f + tab * 42;
     indY = Approach(indY, targetY, 16);
@@ -251,21 +218,19 @@ static void DrawMenu() {
     for (int i = 0; i < NT; i++) {
         ImGui::PushID(i); ImGui::SetCursorPos({12, 80.f + i * 42});
         ImVec2 p = ImGui::GetCursorScreenPos();
-        if (ImGui::InvisibleButton("##tab", {146, 36}) && tab != i) { prevTab = tab; tab = i; tabAnim = 0; }
+        if (ImGui::InvisibleButton("##tab", {146, 36}) && tab != i) { tab = i; tabAnim = 0; }
         float& hv = *ImGui::GetStateStorage()->GetFloatRef(ImGui::GetID("hv"), 0.f);
         hv = Approach(hv, tab == i ? 1.f : (ImGui::IsItemHovered() ? 0.55f : 0.f), 14);
         dl->AddText({p.x + 22 + 4 * hv, p.y + 9}, IM_COL32(235, 235, 245, 120 + (int)(135 * hv)), tabs[i]);
         ImGui::PopID();
     }
 
-    // шапка и подвал
     dl->AddRectFilledMultiColor({wp.x + 186, wp.y + 58}, {wp.x + SZ.x - 16, wp.y + 60}, AccU(0.8f), AccU(0.0f), AccU(0.0f), AccU(0.8f));
     dl->AddText(ImGui::GetFont(), 20, {wp.x + 190, wp.y + 20}, IM_COL32(245, 245, 255, 255), tabs[tab]);
     char foot[64]; snprintf(foot, sizeof foot, "%.0f FPS", ImGui::GetIO().Framerate);
-    dl->AddText({wp.x + 190, wp.y + SZ.y - 28}, IM_COL32(110, 110, 130, 255), "Колесо мыши — прокрутка вкладки");
+    dl->AddText({wp.x + 190, wp.y + SZ.y - 28}, IM_COL32(110, 110, 130, 255), "Esc — закрыть меню");
     dl->AddText({wp.x + SZ.x - 20 - ImGui::CalcTextSize(foot).x, wp.y + SZ.y - 28}, IM_COL32(110, 110, 130, 255), foot);
 
-    // контент
     tabAnim = Approach(tabAnim, 1, 12);
     ImGui::SetCursorPos({186, 68});
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, g_menuAlphaNow * tabAnim);
@@ -288,77 +253,49 @@ static void DrawMenu() {
         RIGHT
         BeginCard("Параметры", cw, RowH(0, 5, 1));
         SliderF("Размер", &cfg.crossSize, 2, 30); SliderF("Зазор", &cfg.crossGap, 0, 20); SliderF("Толщина", &cfg.crossThick, 1, 6);
-        SliderF("Скорость вращения", &cfg.crossSpinSpeed, 10, 360, "%.0f"); SliderF("Расширение при выстреле", &cfg.crossDyn, 0, 20);
+        SliderF("Скорость вращения", &cfg.crossSpinSpeed, 10, 360, "%.0f"); SliderF("Расширение при клике", &cfg.crossDyn, 0, 20);
         ColorRow("Цвет", cfg.crossCol);
         EndCard(); DONE break;
     case 1: LEFT
-        BeginCard("Хитмаркер", cw, RowH(2, 3, 1));
-        Toggle("Включить", &cfg.hitOn); Toggle("Звук попадания", &cfg.hitSound);
-        SliderF("Размер", &cfg.hitSize, 4, 30); SliderF("Длительность", &cfg.hitTime, 0.05f, 1.f, "%.2f"); SliderI("Частота звука, Гц", &cfg.hitFreq, 300, 2000);
-        ColorRow("Цвет", cfg.hitCol);
-        EndCard();
-        BeginCard("Числа урона", cw, RowH(1, 3, 2));
-        Toggle("Включить", &cfg.dmgOn);
-        SliderF("Время жизни", &cfg.dmgLife, 0.3f, 3); SliderF("Подъём", &cfg.dmgRise, 10, 150, "%.0f"); SliderF("Размер текста", &cfg.dmgSize, 12, 40, "%.0f");
-        ColorRow("Обычный", cfg.dmgCol); ColorRow("Критический", cfg.critCol);
+        BeginCard("Эффект клика (ЛКМ в мире)", cw, RowH(1, 5, 1));
+        Toggle("Включить", &cfg.burstOn);
+        SliderI("Количество", &cfg.burstCount, 2, 40); SliderF("Скорость", &cfg.burstSpeed, 30, 300, "%.0f"); SliderF("Время жизни", &cfg.burstLife, 0.2f, 2);
+        SliderF("Гравитация", &cfg.burstGrav, 0, 500, "%.0f"); SliderF("Размер", &cfg.burstSize, 1, 8);
+        ColorRow("Цвет", cfg.burstCol);
         EndCard();
         RIGHT
-        BeginCard("Частицы удара", cw, RowH(1, 5, 1));
-        Toggle("Включить", &cfg.partOn);
-        SliderI("Количество", &cfg.partCount, 2, 40); SliderF("Скорость", &cfg.partSpeed, 30, 300, "%.0f"); SliderF("Время жизни", &cfg.partLife, 0.2f, 2);
-        SliderF("Гравитация", &cfg.partGrav, 0, 500, "%.0f"); SliderF("Размер", &cfg.partSize, 1, 8);
-        ColorRow("Цвет", cfg.partCol);
+        BeginCard("След курсора меню", cw, RowH(1, 2, 1));
+        Toggle("Включить", &cfg.trailOn); SliderF("Длина (сек)", &cfg.trailLife, 0.1f, 1.5f, "%.2f"); SliderF("Ширина", &cfg.trailWidth, 1, 12); ColorRow("Цвет", cfg.trailCol);
         EndCard(); DONE break;
     case 2: LEFT
         BeginCard("Виньетка", cw, RowH(1, 2, 1));
         Toggle("Включить", &cfg.vigOn); SliderF("Размер", &cfg.vigSize, 0.05f, 0.5f, "%.2f"); SliderF("Сила", &cfg.vigStr, 0.1f, 1.f, "%.2f"); ColorRow("Цвет", cfg.vigCol);
         EndCard();
-        BeginCard("Вспышка при попадании", cw, RowH(1, 1, 1));
-        Toggle("Включить", &cfg.flashOn); SliderF("Сила", &cfg.flashStr, 0.1f, 1.f, "%.2f"); ColorRow("Цвет", cfg.flashCol);
-        EndCard();
         RIGHT
-        BeginCard("Низкое здоровье", cw, RowH(1, 1, 0));
-        Toggle("Пульсирующий край", &cfg.lowHpOn); SliderF("Порог HP", &cfg.lowHpThr, 10, 80, "%.0f");
+        BeginCard("Свечение краёв", cw, RowH(1, 2, 1));
+        Toggle("Включить", &cfg.glowOn); SliderF("Размер", &cfg.glowSize, 0.05f, 0.5f, "%.2f"); SliderF("Сила", &cfg.glowStr, 0.1f, 1.f, "%.2f"); ColorRow("Цвет", cfg.glowCol);
         EndCard();
         BeginCard("Цветовой фильтр", cw, RowH(1, 0, 1));
         Toggle("Включить", &cfg.tintOn); ColorRow("Цвет и прозрачность", cfg.tintCol);
-        EndCard();
-        BeginCard("След курсора", cw, RowH(1, 2, 1));
-        Toggle("Включить", &cfg.trailOn); SliderF("Длина (сек)", &cfg.trailLife, 0.1f, 1.5f, "%.2f"); SliderF("Ширина", &cfg.trailWidth, 1, 12); ColorRow("Цвет", cfg.trailCol);
         EndCard(); DONE break;
     case 3: LEFT
-        BeginCard("Информация", cw, RowH(5, 0, 0));
-        Toggle("FPS", &cfg.fpsOn); Toggle("Ватермарк", &cfg.wmOn); Toggle("Часы", &cfg.clockOn); Toggle("График кадров", &cfg.graphOn); Toggle("Полосы HP / броня / патроны", &cfg.barsOn);
-        EndCard();
-        BeginCard("Комбо", cw, RowH(1, 1, 0));
-        Toggle("Счётчик комбо и убийств", &cfg.comboOn); SliderF("Таймаут комбо, с", &cfg.comboTime, 1, 8);
+        BeginCard("Информация", cw, RowH(4, 0, 0));
+        Toggle("FPS", &cfg.fpsOn); Toggle("Ватермарк", &cfg.wmOn); Toggle("Часы", &cfg.clockOn); Toggle("График кадров", &cfg.graphOn);
         EndCard();
         RIGHT
         BeginCard("Клавиши и CPS", cw, RowH(2, 2, 0));
         Toggle("Показ клавиш WASD/мышь", &cfg.ksOn); Toggle("CPS", &cfg.cpsOn);
         SliderF("Позиция X", &cfg.ksX, 0, 0.9f, "%.2f"); SliderF("Позиция Y", &cfg.ksY, 0, 0.9f, "%.2f");
-        EndCard();
-        BeginCard("Компас", cw, RowH(1, 1, 0));
-        Toggle("Включить", &cfg.compOn); SliderF("Ширина", &cfg.compW, 200, 700, "%.0f");
         EndCard(); DONE break;
     case 4: LEFT
-        BeginCard("Зум", cw, RowH(1, 2, 0, 1, 1));
-        Toggle("Включить зум", &cfg.zoomOn); KeyBind("Клавиша", &cfg.zoomKey);
-        ComboRow("Режим", &cfg.zoomMode, "Удержание\0Переключатель\0");
-        SliderF("Множитель FOV", &cfg.zoomFov, 0.1f, 0.9f, "%.2f"); SliderF("Плавность", &cfg.zoomSpeed, 2, 30, "%.0f");
-        EndCard();
-        RIGHT
-        BeginCard("Интеграция", cw, 170);
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + cw - 36);
-        ImGui::TextDisabled("Приложение читает Visuals_GetFovMultiplier() и умножает на него свой FOV. Значение плавно меняется между 1.0 и выбранным множителем.");
-        ImGui::PopTextWrapPos();
-        EndCard(); DONE break;
-    case 5: LEFT
-        BeginCard("Цвета меню", cw, RowH(2, 0, 1, 0, 0, 2));
+        BeginCard("Цвета меню", cw, RowH(2, 0, 1, 0, 0, 3));
         ColorRow("Акцентный цвет", cfg.accent); Toggle("Радужный акцент", &cfg.rainbow); Toggle("Свечение окна", &cfg.glow);
         {
             struct P { const char* n; float c[3]; } pr[] = {{"Фиолетовый", {0.45f, 0.35f, 1}}, {"Циан", {0.1f, 0.8f, 0.95f}}, {"Роза", {1, 0.35f, 0.6f}}, {"Зелёный", {0.3f, 0.9f, 0.5f}}, {"Оранжевый", {1, 0.6f, 0.2f}}};
-            for (auto& p : pr) { ImVec2 s = ImGui::GetCursorScreenPos(); (void)s; if (Button(p.n, (cw - 32) / 2.f)) { cfg.accent[0] = p.c[0]; cfg.accent[1] = p.c[1]; cfg.accent[2] = p.c[2]; } if (&p != &pr[4] && ((&p - pr) % 2 == 0)) ImGui::SameLine(); }
+            for (int i = 0; i < 5; i++) {
+                if (Button(pr[i].n, (cw - 32) / 2.f)) { cfg.accent[0] = pr[i].c[0]; cfg.accent[1] = pr[i].c[1]; cfg.accent[2] = pr[i].c[2]; }
+                if (i % 2 == 0 && i < 4) ImGui::SameLine();
+            }
         }
         EndCard();
         RIGHT
@@ -366,7 +303,7 @@ static void DrawMenu() {
         if (SliderF("Скругление", &cfg.rounding, 0, 18, "%.0f")) ApplyStyle();
         SliderF("Прозрачность меню", &cfg.menuAlpha, 0.5f, 1.f, "%.2f"); SliderF("Скорость анимации", &cfg.animSpeed, 2, 14, "%.0f");
         EndCard(); DONE break;
-    case 6: LEFT
+    case 5: LEFT
         BeginCard("Конфигурация", cw, RowH(0, 0, 0, 0, 1, 3));
         KeyBind("Клавиша меню", &cfg.menuKey);
         if (Button("Сохранить")) SaveCfg();
@@ -375,14 +312,13 @@ static void DrawMenu() {
         EndCard();
         RIGHT
         BeginCard("Статус", cw, 90);
-        ImGui::TextDisabled("Файл: %s", CFG_FILE); ImGui::Text("%s", g_status);
+        ImGui::TextDisabled("Файл: visuals.cfg"); ImGui::Text("%s", g_status);
         EndCard(); DONE break;
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::End();
     ImGui::PopStyleVar();
-    (void)prevTab;
 }
 
 // ============================================================ эффекты
@@ -393,13 +329,11 @@ static void DrawEdgeGlow(ImDrawList* dl, ImVec2 ds, float size, ImU32 c) {
     dl->AddRectFilledMultiColor({0, 0}, {t, ds.y}, c, c0, c0, c);
     dl->AddRectFilledMultiColor({ds.x - t, 0}, {ds.x, ds.y}, c0, c, c, c0);
 }
-static ImU32 ScaleA(const float* c, float a) { return CU(c, ImClamp(a, 0.f, 1.f)); }
 
 static void DrawCrosshair(ImDrawList* dl, ImVec2 c, float dt) {
     static float spin = 0; if (cfg.crossSpin) spin += dt * cfg.crossSpinSpeed * 0.01745f;
-    g_pulse = std::max(0.f, g_pulse - dt * 4); float pulse = g_pulse;
-    if (KeyDown(VK_LBUTTON)) pulse = std::max(pulse, 0.6f);
-    float gap = cfg.crossGap + pulse * cfg.crossDyn, s = cfg.crossSize, th = cfg.crossThick;
+    g_pulse = std::max(0.f, g_pulse - dt * 4);
+    float gap = cfg.crossGap + g_pulse * cfg.crossDyn, s = cfg.crossSize, th = cfg.crossThick;
     auto draw = [&](ImU32 col, float extra) {
         float t = th + extra;
         switch (cfg.crossStyle) {
@@ -418,83 +352,45 @@ static void DrawCrosshair(ImDrawList* dl, ImVec2 c, float dt) {
     draw(CU(cfg.crossCol), 0);
 }
 
+static void SpawnBurst(ImVec2 c) {
+    g_pulse = 1;
+    if (!cfg.burstOn) return;
+    for (int i = 0; i < cfg.burstCount; i++) {
+        float a = (float)i / cfg.burstCount * 6.2831f + (rand() % 100) * 0.01f;
+        float s = cfg.burstSpeed * (0.5f + (rand() % 100) * 0.01f);
+        g_parts.push_back({c.x, c.y, cosf(a) * s, sinf(a) * s, 0});
+    }
+}
+
 static void DrawEffects(float dt) {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     ImGuiIO& io = ImGui::GetIO(); ImVec2 ds = io.DisplaySize, c(ds.x * 0.5f, ds.y * 0.5f);
-    float now = (float)ImGui::GetTime();
 
-    // зум (плавный)
-    g_fov = Approach(g_fov, (cfg.zoomOn && g_zooming) ? cfg.zoomFov : 1.f, cfg.zoomSpeed);
-
-    // экранные эффекты
     if (cfg.tintOn) dl->AddRectFilled({0, 0}, ds, CU(cfg.tintCol));
     if (cfg.vigOn) DrawEdgeGlow(dl, ds, cfg.vigSize, CU(cfg.vigCol, cfg.vigStr));
-    if (cfg.lowHpOn && g_hp < cfg.lowHpThr) {
-        float k = (1 - g_hp / cfg.lowHpThr) * (0.65f + 0.35f * sinf(now * 6));
-        DrawEdgeGlow(dl, ds, 0.25f, IM_COL32(220, 20, 20, (int)(170 * ImClamp(k, 0.f, 1.f))));
-    }
-    if (cfg.flashOn && g_flash > 0) { DrawEdgeGlow(dl, ds, 0.2f, CU(cfg.flashCol, g_flash * cfg.flashStr)); g_flash = std::max(0.f, g_flash - dt * 3); }
+    if (cfg.glowOn) DrawEdgeGlow(dl, ds, cfg.glowSize, CU(cfg.glowCol, cfg.glowStr));
 
-    // след курсора
-    if (cfg.trailOn) {
+    if (cfg.trailOn && g_menuOpen) {
         static ImVec2 last(-1, -1);
-        if (io.MousePos.x > -1000 && (fabsf(io.MousePos.x - last.x) > 1 || fabsf(io.MousePos.y - last.y) > 1)) { g_trail.push_back({io.MousePos, 0}); last = io.MousePos; }
-        for (auto& t : g_trail) t.age += dt;
-        g_trail.erase(std::remove_if(g_trail.begin(), g_trail.end(), [](auto& t) { return t.age >= cfg.trailLife; }), g_trail.end());
-        for (size_t i = 1; i < g_trail.size(); i++) {
-            float k = 1 - g_trail[i].age / cfg.trailLife;
-            dl->AddLine(g_trail[i - 1].p, g_trail[i].p, CU(cfg.trailCol, k), cfg.trailWidth * k + 0.5f);
-        }
-    } else g_trail.clear();
+        if (fabsf(io.MousePos.x - last.x) > 1 || fabsf(io.MousePos.y - last.y) > 1) { g_trail.push_back({io.MousePos, 0}); last = io.MousePos; }
+    }
+    for (auto& t : g_trail) t.age += dt;
+    g_trail.erase(std::remove_if(g_trail.begin(), g_trail.end(), [](auto& t) { return t.age >= cfg.trailLife; }), g_trail.end());
+    for (size_t i = 1; i < g_trail.size(); i++) {
+        float k = 1 - g_trail[i].age / cfg.trailLife;
+        dl->AddLine(g_trail[i - 1].p, g_trail[i].p, CU(cfg.trailCol, k), cfg.trailWidth * k + 0.5f);
+    }
 
     if (cfg.crossOn) DrawCrosshair(dl, c, dt);
 
-    if (cfg.hitOn && g_hitTimer > 0) {
-        float k = g_hitTimer / cfg.hitTime, s = cfg.hitSize, o = 5 + (1 - k) * 4;
-        ImU32 col = g_lastCrit ? CU(cfg.critCol, k) : CU(cfg.hitCol, k);
-        for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2)
-            dl->AddLine({c.x + sx * o, c.y + sy * o}, {c.x + sx * (o + s), c.y + sy * (o + s)}, col, 2);
-        g_hitTimer -= dt;
+    for (auto& p : g_parts) {
+        p.age += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += cfg.burstGrav * dt;
+        float k = 1 - p.age / cfg.burstLife; if (k <= 0) continue;
+        dl->AddCircleFilled({p.x, p.y}, cfg.burstSize * k * 2.2f, CU(cfg.burstCol, k * 0.25f));
+        dl->AddCircleFilled({p.x, p.y}, cfg.burstSize * k + 0.5f, CU(cfg.burstCol, k));
     }
-    if (cfg.dmgOn) {
-        for (auto& d : g_dmg) {
-            d.age += dt; float k = 1 - d.age / cfg.dmgLife; if (k <= 0) continue;
-            char b[16]; snprintf(b, sizeof b, "%.0f", d.val);
-            float pop = 1 + std::max(0.f, 1 - d.age * 8) * (d.crit ? 0.9f : 0.5f);
-            float sz = cfg.dmgSize * pop * (d.crit ? 1.25f : 1.f);
-            ImVec2 pos(d.x + d.drift * d.age - ImGui::CalcTextSize(b).x * 0.5f, d.y - d.age * cfg.dmgRise);
-            dl->AddText(ImGui::GetFont(), sz, {pos.x + 1.5f, pos.y + 1.5f}, IM_COL32(0, 0, 0, (int)(210 * k)), b);
-            dl->AddText(ImGui::GetFont(), sz, pos, d.crit ? CU(cfg.critCol, k) : CU(cfg.dmgCol, k), b);
-        }
-        g_dmg.erase(std::remove_if(g_dmg.begin(), g_dmg.end(), [](auto& d) { return d.age >= cfg.dmgLife; }), g_dmg.end());
-    }
-    if (cfg.partOn) {
-        for (auto& p : g_parts) {
-            p.age += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += cfg.partGrav * dt;
-            float k = 1 - p.age / cfg.partLife; if (k <= 0) continue;
-            dl->AddCircleFilled({p.x, p.y}, cfg.partSize * k * 2.2f, CU(cfg.partCol, k * 0.25f));
-            dl->AddCircleFilled({p.x, p.y}, cfg.partSize * k + 0.5f, CU(cfg.partCol, k));
-        }
-        g_parts.erase(std::remove_if(g_parts.begin(), g_parts.end(), [](auto& p) { return p.age >= cfg.partLife; }), g_parts.end());
-    }
+    g_parts.erase(std::remove_if(g_parts.begin(), g_parts.end(), [](auto& p) { return p.age >= cfg.burstLife; }), g_parts.end());
 
-    // комбо / убийства
-    if (cfg.comboOn) {
-        g_comboTimer -= dt; g_comboPop = std::max(0.f, g_comboPop - dt * 5);
-        if (g_comboTimer <= 0) g_combo = 0;
-        if (g_combo > 1) {
-            char b[24]; snprintf(b, sizeof b, "x%d", g_combo); float sz = 30 * (1 + g_comboPop * 0.5f);
-            ImVec2 ts = ImGui::CalcTextSize(b); float k = ImClamp(g_comboTimer, 0.f, 1.f);
-            dl->AddText(ImGui::GetFont(), sz, {c.x - ts.x * sz / 16.f * 0.5f, ds.y * 0.62f}, AccU(k), b);
-        }
-        if (g_killTimer > 0) {
-            g_killTimer -= dt; float k = ImClamp(g_killTimer, 0.f, 1.f); const char* t = "УБИЙСТВО";
-            float sz = 28; ImVec2 ts = ImGui::CalcTextSize(t);
-            dl->AddText(ImGui::GetFont(), sz, {c.x - ts.x * sz / 16.f * 0.5f, ds.y * 0.68f}, CU(cfg.critCol, k), t);
-        }
-    }
-
-    // ватермарк / FPS / часы
     static float ft[120] = {}; static int fi = 0; ft[fi] = dt * 1000; fi = (fi + 1) % 120;
     if (cfg.fpsOn || cfg.wmOn || cfg.clockOn) {
         char b[96] = ""; SYSTEMTIME st; GetLocalTime(&st);
@@ -517,7 +413,6 @@ static void DrawEffects(float dt) {
         }
     }
 
-    // клавиши и CPS
     if (cfg.ksOn) {
         static float ka[6] = {}; float x = ds.x * cfg.ksX, y = ds.y * cfg.ksY, S = 44, G = 4;
         double tn = GetTickCount64() / 1000.0;
@@ -535,101 +430,158 @@ static void DrawEffects(float dt) {
             dl->AddText({k.p.x + (k.sz.x - ts.x) * 0.5f, k.p.y + (k.sz.y - ts.y) * 0.5f}, IM_COL32_WHITE, lab);
         }
     }
+}
 
-    // полосы HP / броня / патроны
-    if (cfg.barsOn) {
-        float x = 30, y = ds.y - 70, w = 240;
-        auto bar = [&](float yy, float h, float v, ImU32 a, ImU32 b2) {
-            dl->AddRectFilled({x, yy}, {x + w, yy + h}, IM_COL32(12, 12, 16, 190), 4);
-            dl->AddRectFilledMultiColor({x, yy}, {x + w * ImClamp(v / 100.f, 0.f, 1.f), yy + h}, a, b2, b2, a);
-        };
-        bar(y, 14, g_hp, IM_COL32(220, 50, 70, 255), IM_COL32(255, 120, 90, 255));
-        bar(y + 20, 8, g_armor, IM_COL32(60, 120, 255, 255), IM_COL32(100, 200, 255, 255));
-        char b[32]; snprintf(b, sizeof b, "%.0f", g_hp); dl->AddText({x + w + 8, y - 1}, IM_COL32_WHITE, b);
-        snprintf(b, sizeof b, "%d / %d", g_ammo, g_reserve);
-        ImVec2 ts = ImGui::CalcTextSize(b); dl->AddText(ImGui::GetFont(), 30, {ds.x - 40 - ts.x * 30 / 16.f, ds.y - 70}, IM_COL32_WHITE, b);
+// ============================================================ ввод и хук
+typedef BOOL(WINAPI* SwapBuffers_t)(HDC);
+static SwapBuffers_t oSwap = nullptr;
+static WNDPROC oWndProc = nullptr;
+static bool g_ready = false; static volatile LONG g_installed = 0;
+static LARGE_INTEGER g_freq{}, g_last{};
+typedef void(APIENTRY* glBindFramebuffer_t)(unsigned int, unsigned int);
+static glBindFramebuffer_t pBindFramebuffer = nullptr;
+static const unsigned GL_FRAMEBUFFER_ = 0x8D40, GL_FRAMEBUFFER_BINDING_ = 0x8CA6;
+
+static void ClientSize(int& w, int& h) { RECT rc{}; GetClientRect(g_hwnd, &rc); w = rc.right - rc.left; h = rc.bottom - rc.top; }
+
+// Игра в мире просит GLFW скрыть курсор и зажать его в окне. В любом экране курсор обычный.
+static bool CursorCaptured() {
+    CURSORINFO ci{}; ci.cbSize = sizeof(ci);
+    if (GetCursorInfo(&ci)) { if (ci.hCursor == nullptr || !(ci.flags & CURSOR_SHOWING)) return true; }
+    RECT clip{}, client{};
+    if (GetClipCursor(&clip) && GetClientRect(g_hwnd, &client)) {
+        POINT tl{client.left, client.top}, br{client.right, client.bottom};
+        ClientToScreen(g_hwnd, &tl); ClientToScreen(g_hwnd, &br);
+        bool matches = std::abs(clip.left - tl.x) <= 2 && std::abs(clip.top - tl.y) <= 2 && std::abs(clip.right - br.x) <= 2 && std::abs(clip.bottom - br.y) <= 2;
+        bool whole = (clip.right - clip.left) >= GetSystemMetrics(SM_CXVIRTUALSCREEN) && (clip.bottom - clip.top) >= GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (matches && !whole) return true;
     }
+    return false;
+}
+static void ClampCursor() { int w, h; ClientSize(w, h); g_vx = std::fmin((float)(w - 1), std::fmax(0.f, g_vx)); g_vy = std::fmin((float)(h - 1), std::fmax(0.f, g_vy)); }
+static void OpenMenu() {
+    int w, h; ClientSize(w, h); g_vx = w / 2.f; g_vy = h / 2.f; g_menuOpen = true;
+    float sc = g_scale; g_menuPos = {(w / sc - 780) * 0.5f, (h / sc - 520) * 0.5f};
+}
+static void CloseMenu() { g_menuOpen = false; g_bindTarget = nullptr; }
 
-    // компас
-    if (cfg.compOn) {
-        float w = cfg.compW, cx = c.x, y = 16;
-        dl->AddRectFilled({cx - w / 2 - 8, y - 6}, {cx + w / 2 + 8, y + 30}, IM_COL32(12, 12, 16, 170), 8);
-        float base = floorf(g_yaw / 15.f) * 15.f;
-        for (int k = -8; k <= 8; k++) {
-            float deg = base + k * 15.f, off = (deg - g_yaw) / 90.f * (w / 2); float fade = 1 - fabsf(off) / (w / 2); if (fade <= 0) continue;
-            int d = ((int)deg % 360 + 360) % 360; const char* lab = d == 0 ? "N" : d == 90 ? "E" : d == 180 ? "S" : d == 270 ? "W" : nullptr;
-            if (lab) { ImVec2 ts = ImGui::CalcTextSize(lab); dl->AddText({cx + off - ts.x / 2, y + 6}, IM_COL32(255, 255, 255, (int)(255 * fade)), lab); }
-            else dl->AddLine({cx + off, y + 12}, {cx + off, y + 20}, IM_COL32(200, 200, 220, (int)(160 * fade)), 1.f);
+static LRESULT CALLBACK hkWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_bindTarget && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)) { *g_bindTarget = (wp == VK_ESCAPE) ? 0 : (int)wp; g_bindTarget = nullptr; return 0; }
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && !(lp & (1 << 30)) && (int)wp == cfg.menuKey) {
+        if (g_menuOpen) { CloseMenu(); return 0; }
+        if (GetForegroundWindow() == g_hwnd) { OpenMenu(); return 0; }
+    }
+    if (!g_menuOpen) {
+        if (msg == WM_LBUTTONDOWN) { g_clicksL.push_back(GetTickCount64() / 1000.0); if (g_captured) { int w, hh; ClientSize(w, hh); SpawnBurst({w / g_scale * 0.5f, hh / g_scale * 0.5f}); } }
+        else if (msg == WM_RBUTTONDOWN) g_clicksR.push_back(GetTickCount64() / 1000.0);
+        return CallWindowProcW(oWndProc, h, msg, wp, lp);
+    }
+    switch (msg) {   // меню открыто: игра ввода не получает
+    case WM_INPUT: {
+        RAWINPUT ri; UINT size = sizeof(ri);
+        if (g_captured && GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            g_vx += (float)ri.data.mouse.lLastX; g_vy += (float)ri.data.mouse.lLastY; ClampCursor();
         }
-        dl->AddTriangleFilled({cx - 5, y - 4}, {cx + 5, y - 4}, {cx, y + 3}, AccU());
+        return DefWindowProcW(h, msg, wp, lp);
+    }
+    case WM_MOUSEMOVE:
+        if (!g_captured) { g_vx = (float)(short)(lp & 0xFFFF); g_vy = (float)(short)((lp >> 16) & 0xFFFF); ClampCursor(); }
+        return 0;
+    case WM_LBUTTONDOWN: io.AddMouseButtonEvent(0, true); return 0;
+    case WM_LBUTTONUP: io.AddMouseButtonEvent(0, false); return CallWindowProcW(oWndProc, h, msg, wp, lp);
+    case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP: case WM_KEYUP: case WM_SYSKEYUP:
+        return CallWindowProcW(oWndProc, h, msg, wp, lp);
+    case WM_MOUSEWHEEL: io.AddMouseWheelEvent(0.f, GET_WHEEL_DELTA_WPARAM(wp) / 120.f); return 0;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: if (wp == VK_ESCAPE) CloseMenu(); return 0;
+    case WM_KILLFOCUS: CloseMenu(); break;
+    case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN: case WM_CHAR: case WM_SYSCHAR: return 0;
+    default: break;
+    }
+    return CallWindowProcW(oWndProc, h, msg, wp, lp);
+}
+
+static void InitGui(HWND hwnd) {
+    g_hwnd = hwnd;
+    IMGUI_CHECKVERSION(); ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); io.IniFilename = nullptr; io.MouseDrawCursor = false;
+    static ImVector<ImWchar> ranges; ImFontGlyphRangesBuilder builder;
+    builder.AddRanges(io.Fonts->GetGlyphRangesCyrillic()); builder.AddText("—–•…·→✓"); builder.BuildRanges(&ranges);
+    ImFontConfig fc; fc.OversampleH = 2; fc.OversampleV = 1;
+    ImFont* f = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.f, &fc, ranges.Data);
+    if (!f) io.Fonts->AddFontDefault();
+    ImGui_ImplOpenGL3_Init("#version 150");
+    ImGui_ImplOpenGL3_NewFrame();   // создаём текстуру шрифта сразу, чтобы меню не подвисало при первом открытии
+    LoadCfg(true); ApplyStyle();
+    oWndProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)hkWndProc);
+    QueryPerformanceFrequency(&g_freq); QueryPerformanceCounter(&g_last);
+    pBindFramebuffer = (glBindFramebuffer_t)wglGetProcAddress("glBindFramebuffer");
+    g_ready = true;
+}
+
+static void DrawFrame() {
+    ImGuiIO& io = ImGui::GetIO(); int w, h; ClientSize(w, h); if (w <= 0 || h <= 0) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    float dt = (float)((double)(now.QuadPart - g_last.QuadPart) / (double)g_freq.QuadPart); g_last = now;
+    dt = std::fmin(0.1f, std::fmax(0.0001f, dt));
+
+    bool focused = GetForegroundWindow() == g_hwnd;
+    g_captured = CursorCaptured();
+    if (g_menuOpen && !focused) CloseMenu();
+
+    // в маленьком окне уменьшаем интерфейс, чтобы меню 780x520 помещалось
+    g_scale = std::min(1.f, std::min((float)h / 560.f, (float)w / 820.f));
+    io.DeltaTime = dt;
+    io.DisplaySize = ImVec2(w / g_scale, h / g_scale);
+    io.DisplayFramebufferScale = ImVec2(g_scale, g_scale);
+    if (g_menuAnim > 0.001f) io.AddMousePosEvent(g_vx / g_scale, g_vy / g_scale); else io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+
+    int prevFbo = 0; glGetIntegerv(GL_FRAMEBUFFER_BINDING_, &prevFbo);
+    if (pBindFramebuffer) pBindFramebuffer(GL_FRAMEBUFFER_, 0);
+
+    ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
+    UpdateAccent();
+    g_menuAnim = ImClamp(g_menuAnim + (g_menuOpen ? 1.f : -1.f) * dt * cfg.animSpeed, 0.f, 1.f);
+    DrawEffects(dt);
+    if (g_menuAnim > 0.001f) {
+        DrawMenu();
+        if (g_captured) {   // свой курсор, т.к. системный в игре скрыт
+            ImDrawList* fg = ImGui::GetForegroundDrawList(); ImVec2 p(g_vx / g_scale, g_vy / g_scale);
+            fg->AddTriangleFilled(p, {p.x + 12, p.y + 14}, {p.x + 2, p.y + 18}, IM_COL32_WHITE);
+            fg->AddTriangle(p, {p.x + 12, p.y + 14}, {p.x + 2, p.y + 18}, IM_COL32(0, 0, 0, 255), 1.2f);
+        }
+    }
+    ImGui::Render();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (pBindFramebuffer) pBindFramebuffer(GL_FRAMEBUFFER_, (unsigned)prevFbo);
+}
+
+static BOOL WINAPI hkSwapBuffers(HDC dc) {
+    HWND w = WindowFromDC(dc);
+    if (!g_ready && w) { char cls[64] = {}; GetClassNameA(w, cls, sizeof cls); if (std::strncmp(cls, "GLFW", 4) == 0) InitGui(w); }
+    if (g_ready && w == g_hwnd) DrawFrame();
+    return oSwap(dc);
+}
+
+static void Install() {
+    if (InterlockedCompareExchange(&g_installed, 1, 0) != 0) return;   // уже установлено
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&Install, &self);
+    wchar_t buf[MAX_PATH] = {};
+    if (GetModuleFileNameW(self, buf, MAX_PATH)) { std::wstring p(buf); size_t s = p.find_last_of(L"\\/"); g_dir = s == std::wstring::npos ? L"." : p.substr(0, s); }
+    if (MH_Initialize() == MH_OK) {
+        void* target = (void*)GetProcAddress(LoadLibraryA("gdi32.dll"), "SwapBuffers");
+        if (target && MH_CreateHook(target, (void*)&hkSwapBuffers, (void**)&oSwap) == MH_OK) MH_EnableHook(target);
     }
 }
 
-// ============================================================ хук Present
-typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
-static PresentFn oPresent = nullptr; static WNDPROC oWndProc = nullptr;
-static ID3D11Device* g_dev = nullptr; static ID3D11DeviceContext* g_ctx = nullptr; static bool g_init = false;
+static DWORD WINAPI InstallThread(LPVOID) { Install(); return 0; }
 
-static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (g_bindTarget && m == WM_KEYDOWN) { *g_bindTarget = (w == VK_ESCAPE) ? 0 : (int)w; g_bindTarget = nullptr; return 0; }
-    if (m == WM_KEYDOWN && !(l & 0x40000000)) {
-        if ((int)w == cfg.menuKey) g_menuOpen = !g_menuOpen;
-        if ((int)w == cfg.zoomKey) g_zooming = cfg.zoomMode == 0 ? true : !g_zooming;
-    }
-    if (m == WM_KEYUP && (int)w == cfg.zoomKey && cfg.zoomMode == 0) g_zooming = false;
-    if (m == WM_LBUTTONDOWN) g_clicksL.push_back(GetTickCount64() / 1000.0);
-    if (m == WM_RBUTTONDOWN) g_clicksR.push_back(GetTickCount64() / 1000.0);
-    if (g_menuOpen && ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return true;
-    return CallWindowProcW(oWndProc, h, m, w, l);
-}
+extern "C" __declspec(dllexport) int JNI_OnLoad(void*, void*) { Install(); return 0x00010008; }          // System.load
+extern "C" __declspec(dllexport) int Agent_OnLoad(void*, char*, void*) { Install(); return 0; }          // -agentpath
 
-static HRESULT __stdcall HookedPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    if (!g_init && SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_dev))) {
-        g_dev->GetImmediateContext(&g_ctx);
-        DXGI_SWAP_CHAIN_DESC d; sc->GetDesc(&d); g_hwnd = d.OutputWindow;
-        ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO(); io.IniFilename = nullptr;
-        io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16, nullptr, io.Fonts->GetGlyphRangesCyrillic());
-        ImGui_ImplWin32_Init(g_hwnd); ImGui_ImplDX11_Init(g_dev, g_ctx);
-        LoadCfg(); ApplyStyle(); g_status[0] = 0;
-        oWndProc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)WndProc);
-        g_init = true;
-    }
-    if (g_init) {
-        ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
-        float dt = ImGui::GetIO().DeltaTime;
-        UpdateAccent();
-        g_menuAnim = ImClamp(g_menuAnim + (g_menuOpen ? 1.f : -1.f) * dt * cfg.animSpeed, 0.f, 1.f);
-        ImGui::GetIO().MouseDrawCursor = g_menuAnim > 0.01f;
-        DrawEffects(dt);
-        if (g_menuAnim > 0.001f) DrawMenu();
-        ImGui::Render();
-        ID3D11Texture2D* bb = nullptr; ID3D11RenderTargetView* rtv = nullptr;
-        sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
-        g_dev->CreateRenderTargetView(bb, nullptr, &rtv);
-        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        rtv->Release(); bb->Release();
-    }
-    return oPresent(sc, sync, flags);
-}
-
-static DWORD WINAPI Init(LPVOID) {
-    WNDCLASSEXW wc = {sizeof wc, CS_CLASSDC, DefWindowProcW, 0, 0, GetModuleHandleW(nullptr), 0, 0, 0, 0, L"vtmp", 0};
-    RegisterClassExW(&wc);
-    HWND tmp = CreateWindowW(wc.lpszClassName, L"", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, 0, 0, wc.hInstance, 0);
-    DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferCount = 1; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = tmp; sd.SampleDesc.Count = 1; sd.Windowed = TRUE;
-    IDXGISwapChain* sc = nullptr; ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; D3D_FEATURE_LEVEL fl;
-    if (SUCCEEDED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, 0, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx))) {
-        void** vt = *(void***)sc; MH_Initialize();
-        MH_CreateHook(vt[8], &HookedPresent, (void**)&oPresent); MH_EnableHook(MH_ALL_HOOKS);
-        sc->Release(); dev->Release(); ctx->Release();
-    }
-    DestroyWindow(tmp); UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    return 0;
-}
-
-BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); CreateThread(nullptr, 0, Init, nullptr, 0, nullptr); }
+BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {                                                  // LoadLibrary / инжектор
+    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(h); CreateThread(nullptr, 0, InstallThread, nullptr, 0, nullptr); }
     return TRUE;
 }

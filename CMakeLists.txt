@@ -35,5 +35,5 @@ target_include_directories(minhook_lib PUBLIC ${minhook_SOURCE_DIR}/include)
 
 add_library(visuals SHARED src/visuals_overlay.cpp)
 target_compile_options(visuals PRIVATE /utf-8 /W3)
-target_link_libraries(visuals PRIVATE imgui_lib minhook_lib opengl32)
+target_link_libraries(visuals PRIVATE imgui_lib minhook_lib opengl32 psapi)
 set_target_properties(visuals PROPERTIES OUTPUT_NAME "visuals")

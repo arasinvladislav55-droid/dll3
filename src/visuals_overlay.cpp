@@ -1,4 +1,4 @@
-// Visuals Overlay v4 — косметический OpenGL-оверлей для Minecraft Java Edition (Windows x64).
+// Visuals Overlay v5 — косметический OpenGL-оверлей для Minecraft Java Edition (Windows x64).
 // Хукает gdi32!SwapBuffers (его вызывает GLFW/LWJGL) и рисует ImGui поверх кадра игры.
 // Загрузка: System.load / -agentpath (JNI_OnLoad / Agent_OnLoad) либо обычный LoadLibrary (DllMain).
 // Меню: INSERT (меняется в настройках).
@@ -31,7 +31,7 @@
 
 // ============================================================ конфиг
 struct Config {
-    int version = 4;
+    int version = 5;
     bool enabled = true;                 // мастер-выключатель оверлея
 
     // --- прицел
@@ -100,6 +100,7 @@ struct Config {
     float rounding = 10, menuAlpha = 0.97f, animSpeed = 6;
     float dim = 0.55f;
     bool autoSave = true;
+    bool hideInMenus = true;             // показывать HUD/эффекты только в мире (не в меню игры)
 } cfg;
 
 // ============================================================ файлы конфига
@@ -122,7 +123,7 @@ static bool SaveCfg(int slot = 0, bool quiet = false) {
 static bool LoadCfg(int slot = 0, bool quiet = false) {
     if (FILE* f = _wfopen(SlotPath(slot).c_str(), L"rb")) {
         Config t;
-        if (fread(&t, sizeof t, 1, f) == 1 && t.version == 4) {
+        if (fread(&t, sizeof t, 1, f) == 1 && t.version == 5) {
             cfg = t;
             if (!quiet) snprintf(g_status, sizeof g_status, "Загружено: %s", slot ? ("слот " + std::to_string(slot)).c_str() : "visuals.cfg");
             fclose(f);
@@ -168,6 +169,7 @@ static HWND g_hwnd = nullptr;
 static ImVec4 g_acc;
 static float g_vx = 0, g_vy = 0, g_scale = 1;
 static bool g_captured = false;
+static bool g_inGame = false;       // курсор захвачен игрой = игрок в мире, а не в меню
 static ULONGLONG g_startMs = 0;
 static bool g_firstFrame = true;
 
@@ -745,7 +747,7 @@ static void DrawWatermark(ImVec2 ds) {
                                 AccU(0.f), AccU(0.9f), AccU(0.9f), AccU(0.f));
 
     AddTextGradient(dl, fb, nameFs, ImVec2(x + padX, y + (h - ns.y) * 0.5f - 1), name, AccU(), IM_COL32(255, 255, 255, 240));
-    dl->AddText(f, 10 * s, ImVec2(x + padX + ns.x - 2, y + h - 15 * s), IM_COL32(150, 150, 175, 200), "v4");
+    dl->AddText(f, 10 * s, ImVec2(x + padX + ns.x - 2, y + h - 15 * s), IM_COL32(150, 150, 175, 200), "v5");
 
     if (fps[0]) {
         ImVec2 a(cx, y + 7 * s);
@@ -938,10 +940,13 @@ static void DrawEffects(float dt) {
     g_fpsHist[g_fpsIdx] = dt * 1000.f;
     g_fpsIdx = (g_fpsIdx + 1) % 120;
 
-    if (!cfg.enabled) {
+    // В главном меню/паузе курсор не захвачен — HUD и эффекты не рисуем.
+    bool showWorld = cfg.enabled && (!cfg.hideInMenus || g_inGame);
+    if (!showWorld) {
         g_parts.clear();
         g_rings.clear();
         g_dust.clear();
+        g_trail.clear();
     } else {
         if (cfg.tintOn) dl->AddRectFilled(ImVec2(0, 0), ds, CU(cfg.tintCol));
         if (cfg.vigOn) DrawEdgeGlow(dl, ds, cfg.vigSize, CU(cfg.vigCol, cfg.vigStr));
@@ -1031,25 +1036,115 @@ static void DrawEffects(float dt) {
 
         if (g_firstFrame) {
             g_firstFrame = false;
-            if (cfg.notifOn) Toast("Visuals Overlay v4 · INSERT — меню");
+            if (cfg.notifOn) Toast("Visuals Overlay v5 · INSERT — меню");
         }
     }
-    DrawToasts(dt);
+    if (showWorld || g_menuOpen) DrawToasts(dt);
 }
+// ============================================================ функции (grid как в PulseVisuals)
+struct ModuleEntry {
+    const char* name;
+    const char* desc;
+    bool* value;
+    int cat;   // 1 — Visuals, 2 — HUD, 3 — Utilities
+};
+static const ModuleEntry kModules[] = {
+    {"Crosshair", "прицел и пресеты", &cfg.crossOn, 1},
+    {"Click FX", "частицы и искры", &cfg.burstOn, 1},
+    {"Shockwave", "кольцо от клика", &cfg.ringOn, 1},
+    {"Edge Flash", "вспышка краёв", &cfg.flashOn, 1},
+    {"Ambient", "пыль в воздухе", &cfg.dustOn, 1},
+    {"Cursor Trail", "след в меню", &cfg.trailOn, 1},
+    {"Vignette", "затемнение краёв", &cfg.vigOn, 1},
+    {"Edge Glow", "свечение краёв", &cfg.glowOn, 1},
+    {"Tint", "цветовой фильтр", &cfg.tintOn, 1},
+    {"Bloom", "свечение центра", &cfg.bloomOn, 1},
+    {"Watermark", "лого, FPS, часы", &cfg.wmOn, 2},
+    {"FPS Graph", "история кадров", &cfg.graphOn, 2},
+    {"Keystrokes", "WASD и CPS", &cfg.ksOn, 2},
+    {"Module List", "активные функции", &cfg.listOn, 2},
+    {"System Info", "uptime и RAM", &cfg.sysOn, 2},
+    {"Notifications", "уведомления", &cfg.notifOn, 2},
+    {"Rainbow", "радужный акцент", &cfg.rainbow, 3},
+    {"Window Glow", "свечение окна", &cfg.glow, 3},
+    {"Auto Save", "сохранение конфига", &cfg.autoSave, 3},
+    {"Hide Outside", "не показывать в меню MC", &cfg.hideInMenus, 3},
+    {"Crosshair in GUI", "скрывать прицел в меню", &cfg.crossHideMenu, 3},
+};
+static const int kModuleCount = (int)(sizeof(kModules) / sizeof(kModules[0]));
+
+static bool CatChip(const char* label, bool active, float w) {
+    ImGui::PushID(label);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pr = ImGui::InvisibleButton("##cat", ImVec2(w, 26));
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    float& hv = *ImGui::GetStateStorage()->GetFloatRef(ImGui::GetID("h"), 0.f);
+    hv = Approach(hv, ImGui::IsItemHovered() ? 1.f : 0.f, 16);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + 26), active ? AccU(0.20f + 0.10f * hv) : IM_COL32(24, 24, 33, 255), 7);
+    dl->AddRect(p, ImVec2(p.x + w, p.y + 26), active ? AccU(0.55f) : IM_COL32(255, 255, 255, 16 + (int)(22 * hv)), 7);
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + 5),
+                active ? IM_COL32(245, 245, 255, 255) : IM_COL32(180, 180, 200, 235), label);
+    ImGui::PopID();
+    return pr;
+}
+
+static bool ModuleCard(const char* name, const char* desc, bool* value, float w) {
+    ImGui::PushID(name);
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    bool pr = ImGui::InvisibleButton("##mod", ImVec2(w, 46));
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    float& hv = *ImGui::GetStateStorage()->GetFloatRef(ImGui::GetID("hv"), 0.f);
+    float& pop = *ImGui::GetStateStorage()->GetFloatRef(ImGui::GetID("pop"), 0.f);
+    hv = Approach(hv, ImGui::IsItemHovered() ? 1.f : 0.f, 18);
+    pop = std::max(0.f, pop - ImGui::GetIO().DeltaTime * 4.f);
+    bool on = *value;
+    if (pr) {
+        *value = !on;
+        on = *value;
+        pop = 1.f;
+    }
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 bg = on ? AccU(0.10f + 0.05f * hv + 0.05f * pop) : IM_COL32(24, 24, 34, 235);
+    if (!on && hv > 0.01f) bg = IM_COL32(30, 30, 42, 240);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + 46), bg, 9);
+    dl->AddRect(p, ImVec2(p.x + w, p.y + 46),
+                on ? AccU(0.40f + 0.25f * hv) : IM_COL32(255, 255, 255, 14 + (int)(18 * hv)), 9);
+
+    ImVec2 dot(p.x + 16, p.y + 23);
+    dl->AddCircleFilled(dot, 6.f + pop * 2.f, on ? AccU(0.16f + 0.20f * pop) : IM_COL32(255, 255, 255, 8), 20);
+    dl->AddCircleFilled(dot, 3.2f, on ? AccU() : IM_COL32(110, 110, 130, 255), 16);
+
+    ImFont* f = g_font ? g_font : ImGui::GetFont();
+    dl->AddText(f, 13.f, ImVec2(p.x + 30, p.y + 8),
+                on ? IM_COL32(240, 240, 250, 255) : IM_COL32(205, 205, 220, 240), name);
+    dl->AddText(f, 11.f, ImVec2(p.x + 30, p.y + 26), IM_COL32(130, 130, 155, 210), desc);
+
+    float sw = 26, sh = 14, sx = p.x + w - sw - 12, sy = p.y + 16;
+    dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + sw, sy + sh),
+                      on ? AccU(0.85f) : IM_COL32(255, 255, 255, 20), sh * 0.5f);
+    dl->AddCircleFilled(ImVec2(on ? sx + sw - sh * 0.5f : sx + sh * 0.5f, sy + sh * 0.5f),
+                        sh * 0.5f - 2.5f, IM_COL32(255, 255, 255, 245), 16);
+    ImGui::PopID();
+    return pr;
+}
+
 // ============================================================ меню
 static void DrawMenu() {
     static float indY = 100;
     int& tab = g_menuTab;
     float& tabAnim = g_menuTabAnim;
-    const char* tabs[] = {"Прицел", "Эффекты", "Экран", "HUD", "Тема", "Конфиг"};
+    const char* tabs[] = {"Функции", "Прицел", "Эффекты", "Экран", "HUD", "Тема", "Конфиг"};
     const char* subs[] = {
+        "Все модули оверлея — включение одним кликом",
         "12 стилей, пресеты, свечение и реакция на клик",
         "Частицы, ударная волна, вспышка и атмосфера",
         "Виньетка, свечение краёв, тон и bloom",
         "Ватермарк, график FPS, клавиши и список модулей",
         "Акцент, форма окна и анимации",
         "Клавиши, профили и сброс настроек"};
-    const int NT = 6;
+    const int NT = 7;
     const ImVec2 SZ(820, 600);
     float e = 1 - powf(1 - g_menuAnim, 3.f);
     g_menuAlphaNow = cfg.menuAlpha;
@@ -1078,7 +1173,7 @@ static void DrawMenu() {
     dl->AddRectFilled(wp, ImVec2(wp.x + 184, wp.y + SZ.y), IM_COL32(11, 11, 17, 255), R, ImDrawFlags_RoundCornersLeft);
     dl->AddRectFilled(ImVec2(wp.x + 184, wp.y + 14), ImVec2(wp.x + 185, wp.y + SZ.y - 14), IM_COL32(255, 255, 255, 10));
     AddTextGradient(dl, g_fontBig ? g_fontBig : ImGui::GetFont(), 21, ImVec2(wp.x + 22, wp.y + 18), "VISUALS", AccU(), IM_COL32(255, 255, 255, 240));
-    dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 23, wp.y + 46), IM_COL32(120, 120, 145, 220), "OVERLAY v4 · OPENGL");
+    dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 23, wp.y + 46), IM_COL32(120, 120, 145, 220), "OVERLAY v5 · OPENGL");
     dl->AddRectFilled(ImVec2(wp.x + 22, wp.y + 66), ImVec2(wp.x + 88, wp.y + 68), AccU(0.85f), 1);
 
     float targetY = 100.f + tab * 40.f;
@@ -1119,7 +1214,7 @@ static void DrawMenu() {
         dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 18, wp.y + SZ.y - 50), IM_COL32(115, 115, 135, 200), hint);
         snprintf(hint, sizeof hint, "%s — вкл/выкл", tk);
         dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 18, wp.y + SZ.y - 34), IM_COL32(115, 115, 135, 200), hint);
-        dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 18, wp.y + SZ.y - 18), IM_COL32(115, 115, 135, 200), "1–6 — вкладки");
+        dl->AddText(ImGui::GetFont(), 11, ImVec2(wp.x + 18, wp.y + SZ.y - 18), IM_COL32(115, 115, 135, 200), "1–7 — вкладки");
     }
 
     dl->AddText(g_fontBig ? g_fontBig : ImGui::GetFont(), 21, ImVec2(wp.x + 206, wp.y + 16), IM_COL32(245, 245, 252, 255), tabs[tab]);
@@ -1138,7 +1233,7 @@ static void DrawMenu() {
     ImGui::SetCursorPos(ImVec2(196 + (1 - tabAnim) * 10, 84));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::BeginChild("##content", ImVec2(SZ.x - 212, SZ.y - 118), ImGuiChildFlags_None, ImGuiWindowFlags_None);
+    ImGui::BeginChild("##content", ImVec2(SZ.x - 212, SZ.y - 118), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleColor();
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, g_menuAlphaNow);
 
@@ -1148,7 +1243,48 @@ static void DrawMenu() {
     float cx1 = 2, cx2 = 2 + cw + 12;
 
     switch (tab) {
-    case 0: {
+    case 0: {   // функции: сетка модулей как в PulseVisuals
+        static int cat = 0;
+        int prevCat = cat;
+        int cnt[4] = {0, 0, 0, 0};
+        for (const ModuleEntry& m : kModules) { cnt[0]++; cnt[m.cat]++; }
+        int active = 0;
+        for (const ModuleEntry& m : kModules) if (*m.value) active++;
+
+        float y0 = ImGui::GetCursorPosY();
+        ImVec2 rowP = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorPos(ImVec2(2, y0));
+        const char* cats[4] = {"Все", "Visuals", "HUD", "Utilities"};
+        for (int i = 0; i < 4; i++) {
+            char lbl[48];
+            snprintf(lbl, sizeof lbl, "%s  %d", cats[i], cnt[i]);
+            float wch = ImGui::CalcTextSize(lbl).x + 26;
+            if (i) ImGui::SameLine(0, 8);
+            if (CatChip(lbl, cat == i, wch)) cat = i;
+        }
+        {
+            char info[48];
+            snprintf(info, sizeof info, "%d / %d активно", active, kModuleCount);
+            ImVec2 ts = ImGui::CalcTextSize(info);
+            ImGui::GetWindowDrawList()->AddText(ImVec2(rowP.x + contentW - 18 - ts.x, rowP.y + 6),
+                                                IM_COL32(130, 130, 155, 220), info);
+        }
+        if (cat != prevCat) ImGui::SetScrollY(0.f);
+        ImGui::SetCursorPos(ImVec2(2, y0 + 38));
+        {
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + contentW - 8, p.y + 1), IM_COL32(255, 255, 255, 12));
+        }
+        ImGui::SetCursorPos(ImVec2(2, y0 + 50));
+        int col = 0;
+        for (const ModuleEntry& m : kModules) {
+            if (cat && m.cat != cat) continue;
+            if (col) ImGui::SameLine(0, 12);
+            ModuleCard(m.name, m.desc, m.value, cw);
+            col = 1 - col;
+        }
+    } break;
+    case 1: {
         float yL = 0, yR = 0;
         BeginCard("Предпросмотр", cx1, yL, cw);
         {
@@ -1216,7 +1352,7 @@ static void DrawMenu() {
         EndCard();
         (void)yL;
     } break;
-    case 1: {
+    case 2: {
         float yL = 0, yR = 0;
         BeginCard("Эффект клика", cx1, 0, cw);
         Toggle("Включить", &cfg.burstOn);
@@ -1259,7 +1395,7 @@ static void DrawMenu() {
         EndCard();
         (void)yL;
     } break;
-    case 2: {
+    case 3: {
         float yL = 0, yR = 0;
         BeginCard("Виньетка", cx1, 0, cw);
         Toggle("Включить", &cfg.vigOn);
@@ -1293,7 +1429,7 @@ static void DrawMenu() {
         Toggle("Скрывать прицел в меню", &cfg.crossHideMenu);
         EndCard();
     } break;
-    case 3: {
+    case 4: {
         float yL = 0, yR = 0;
         BeginCard("Ватермарк", cx1, 0, cw);
         Toggle("Включить", &cfg.wmOn);
@@ -1336,7 +1472,7 @@ static void DrawMenu() {
         EndCard();
         (void)yL;
     } break;
-    case 4: {
+    case 5: {
         static const struct { const char* id; float c[3]; } themes[] = {
             {"purple", {0.45f, 0.35f, 1.0f}},
             {"cyan", {0.10f, 0.80f, 0.95f}},
@@ -1374,7 +1510,7 @@ static void DrawMenu() {
         ImGui::PopTextWrapPos();
         EndCard();
     } break;
-    case 5: {
+    case 6: {
         float yL = 0, yR = 0;
         BeginCard("Клавиши", cx1, 0, cw);
         KeyBind("Меню", &cfg.menuKey);
@@ -1417,15 +1553,37 @@ static void DrawMenu() {
 
         BeginCard("О программе", cx2, yR + 12, cw);
         ImGui::PushTextWrapPos(g_card.x + 14 + CW());
-        ImGui::TextWrapped("Visuals Overlay v4 — косметический слой: прицел, эффекты клика, HUD и атмосфера. "
+        ImGui::TextWrapped("Visuals Overlay v5 — косметический слой: прицел, эффекты клика, HUD и атмосфера. "
                            "Оверлей не читает данные игры: только отрисовка поверх кадра.");
         ImGui::PopTextWrapPos();
         Toggle("Скрывать прицел в меню", &cfg.crossHideMenu);
+        Toggle("Скрывать вне игры", &cfg.hideInMenus);
         EndCard();
         (void)yL;
     } break;
+    }
 
-
+    // мягкое затухание у краёв и свой акцентный скроллбар
+    {
+        ImVec2 cp2 = ImGui::GetWindowPos();
+        ImVec2 cs2 = ImGui::GetWindowSize();
+        float scy = ImGui::GetScrollY(), scm = ImGui::GetScrollMaxY();
+        ImDrawList* cdl = ImGui::GetWindowDrawList();
+        if (scy > 1)
+            cdl->AddRectFilledMultiColor(ImVec2(cp2.x, cp2.y), ImVec2(cp2.x + cs2.x, cp2.y + 20),
+                                         IM_COL32(14, 14, 19, 255), IM_COL32(14, 14, 19, 255),
+                                         IM_COL32(14, 14, 19, 0), IM_COL32(14, 14, 19, 0));
+        if (scm - scy > 1)
+            cdl->AddRectFilledMultiColor(ImVec2(cp2.x, cp2.y + cs2.y - 20), ImVec2(cp2.x + cs2.x, cp2.y + cs2.y),
+                                         IM_COL32(14, 14, 19, 0), IM_COL32(14, 14, 19, 0),
+                                         IM_COL32(14, 14, 19, 255), IM_COL32(14, 14, 19, 255));
+        if (scm > 1) {
+            float bx = cp2.x + cs2.x - 6, by = cp2.y + 6, bh = cs2.y - 12;
+            float gh = ImMax(28.f, bh * (cs2.y / (cs2.y + scm)));
+            float gy = by + (bh - gh) * ImClamp(scy / scm, 0.f, 1.f);
+            cdl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + 4, by + bh), IM_COL32(255, 255, 255, 10), 2);
+            cdl->AddRectFilled(ImVec2(bx, gy), ImVec2(bx + 4, gy + gh), AccU(0.60f), 2);
+        }
     }
 
     ImGui::PopStyleVar();
@@ -1588,7 +1746,7 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         if (wp == VK_ESCAPE) CloseMenu();
-        else if (wp >= '1' && wp <= '6') { g_menuTab = (int)wp - '1'; g_menuTabAnim = 0; }
+        else if (wp >= '1' && wp <= '7') { g_menuTab = (int)wp - '1'; g_menuTabAnim = 0; }
         return 0;
     case WM_CHAR:
     case WM_SYSCHAR:
@@ -1651,6 +1809,7 @@ static void DrawFrame() {
 
     bool focused = GetForegroundWindow() == g_hwnd;
     g_captured = CursorCaptured();
+    g_inGame = focused && g_captured;
     if (g_menuOpen && !focused) CloseMenu();
 
     g_scale = std::min(1.f, std::min((float)h / 640.f, (float)w / 860.f));

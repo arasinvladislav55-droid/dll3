@@ -2,34 +2,45 @@ name: Build DLL
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      # Build outside the repository: a stray file/folder named "build" in the
+      # repo can never break CMake's pkgRedirects directory then.
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: cmake -S . -B "${{ runner.temp }}/uv-build" -A x64
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build "${{ runner.temp }}/uv-build" --config Release --parallel
 
-      - name: Upload artifact
+      - name: Show artifact
+        shell: pwsh
+        run: Get-ChildItem "${{ runner.temp }}/uv-build/Release" | Select-Object Name, Length
+
+      - name: Upload UniversalVisuals.dll
         uses: actions/upload-artifact@v4
         with:
-          name: visuals-dll
-          path: build/Release/visuals.dll
+          name: UniversalVisuals-dll
+          path: ${{ runner.temp }}/uv-build/Release/UniversalVisuals.dll
+          if-no-files-found: error
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: build/Release/visuals.dll
+          files: ${{ runner.temp }}/uv-build/Release/UniversalVisuals.dll
+          generate_release_notes: true
